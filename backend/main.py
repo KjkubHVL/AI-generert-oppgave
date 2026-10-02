@@ -1,1 +1,80 @@
-\"\"\"FastAPI backend for MatteHjelpen.\n\nHovedserver som orkhestrerer LLM, verktøy og validering.\n\"\"\"\n\nimport json\nimport os\nfrom pathlib import Path\nfrom typing import Dict, Any\n\nfrom fastapi import FastAPI, HTTPException\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom fastapi.responses import FileResponse, JSONResponse\nfrom fastapi.staticfiles import StaticFiles\n\nfrom backend.llm_client import solve_task\nfrom backend.validator import validate_solution\n\napp = FastAPI(\n    title=\"MatteHjelpen\",\n    description=\"AI-drevet matteløser med SymPy-verktøy\",\n    version=\"1.0.0\"\n)\n\n# CORS for lokal utvikling\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\"*\"],\n    allow_credentials=True,\n    allow_methods=[\"*\"],\n    allow_headers=[\"*\"],\n)\n\n# Statisk frontend\nfrontend_dir = Path(__file__).resolve().parent.parent / \"frontend\"\n\nif frontend_dir.exists():\n    try:\n        app.mount(\"/static\", StaticFiles(directory=str(frontend_dir)), name=\"static\")\n    except:\n        pass\n\n\n@app.get(\"/\")\ndef read_root():\n    \"\"\"Hent frontend.\"\"\"\n    index_file = frontend_dir / \"index.html\"\n    if index_file.exists():\n        return FileResponse(str(index_file))\n    return {\"message\": \"MatteHjelpen backend kjører\"}\n\n\n@app.get(\"/health\")\ndef health_check():\n    \"\"\"Helsesjekk.\"\"\"\n    return {\"status\": \"ok\", \"service\": \"MatteHjelpen\"}\n\n\n@app.post(\"/solve\")\ndef solve_endpoint(payload: Dict[str, Any]):\n    \"\"\"Løs en matteoppgave.\n    \n    Request:\n        {\"oppgave\": \"Deriver f(x) = x^2 + 3*x + 1\"}\n    \n    Response:\n        {\n            \"svar\": \"...\",\n            \"steg\": [...],\n            \"formler_brukt\": [...],\n            \"validert\": bool,\n            \"validering\": {...},\n            \"verifisert_av_verktoy\": bool,\n            \"tokens_brukt\": int,\n            \"estimert_kostnad\": float\n        }\n    \"\"\"\n    try:\n        oppgave = payload.get(\"oppgave\", \"\")\n        \n        # Validering av input\n        if not isinstance(oppgave, str):\n            raise ValueError(\"Feltet 'oppgave' må være en tekststreng.\")\n        \n        if not oppgave.strip():\n            raise ValueError(\"Oppgave er tom.\")\n        \n        if len(oppgave) > 5000:\n            raise ValueError(\"Oppgave er for lang (max 5000 tegn).\")\n        \n        # Løs oppgaven\n        result = solve_task(oppgave)\n        \n        # Valider svaret\n        validation_result = validate_solution(oppgave, result.get(\"svar\", \"\"))\n        \n        # Legg valideringsresultatet til respons\n        result[\"validering\"] = validation_result\n        result[\"validert\"] = validation_result.get(\"validert\", False)\n        \n        # Oppdater \"verifisert_av_verktoy\" basert på om verktøy ble brukt\n        if \"tool_calls\" in result:\n            result[\"verifisert_av_verktoy\"] = len(result[\"tool_calls\"]) > 0\n        \n        # Sikre at alle nødvendige felt finnes\n        result.setdefault(\"svar\", \"\")\n        result.setdefault(\"steg\", [])\n        result.setdefault(\"formler_brukt\", [])\n        result.setdefault(\"tokens_brukt\", 0)\n        result.setdefault(\"estimert_kostnad\", 0.0)\n        \n        return result\n    \n    except ValueError as e:\n        raise HTTPException(status_code=400, detail=str(e))\n    except RuntimeError as e:\n        raise HTTPException(status_code=503, detail=f\"Backend-feil: {str(e)}\")\n    except Exception as e:\n        raise HTTPException(status_code=500, detail=f\"Uventet feil: {str(e)}\")\n\n\n@app.get(\"/config\")\ndef get_config():\n    \"\"\"Hent konfigurasjon (modellnavn, osv.) - API-nøkkel vises IKKE.\"\"\"\n    return {\n        \"model\": os.getenv(\"MODEL_NAME\", \"ukjent\"),\n        \"api_base\": os.getenv(\"API_BASE_URL\", \"ukjent\"),\n        \"use_live_model\": os.getenv(\"USE_LIVE_MODEL\", \"false\").lower() == \"true\",\n    }\n\n\nif __name__ == \"__main__\":\n    import uvicorn\n    uvicorn.run(app, host=\"0.0.0.0\", port=8000, reload=True)\n"
+"""FastAPI-app for MatteHjelpen."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from backend.llm_client import solve_task
+from backend.validator import validate_solution
+
+app = FastAPI(title="MatteHjelpen", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+if frontend_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+
+
+@app.get("/")
+def read_root():
+    index_file = frontend_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return {"message": "MatteHjelpen backend kjører."}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/config")
+def config():
+    return {
+        "model": os.getenv("MODEL_NAME", "ukjent"),
+        "api_base": os.getenv("API_BASE_URL", "ukjent"),
+        "use_live_model": os.getenv("USE_LIVE_MODEL", "false").lower() == "true",
+    }
+
+
+@app.post("/solve")
+def solve_endpoint(payload: dict):
+    try:
+        oppgave = payload.get("oppgave", "")
+        if not isinstance(oppgave, str):
+            raise ValueError("Feltet 'oppgave' må være tekst.")
+        if not oppgave.strip():
+            raise ValueError("Oppgave er tom.")
+
+        result = solve_task(oppgave)
+        validation = validate_solution(oppgave, result.get("svar", ""))
+        result["validert"] = validation.get("validert", False)
+        result["validering"] = validation
+        result.setdefault("tokens_brukt", 0)
+        result.setdefault("estimert_kostnad", 0.0)
+        result.setdefault("formler_brukt", [])
+        result.setdefault("steg", [])
+        result.setdefault("verifisert_av_verktoy", bool(result.get("tool_calls")))
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Uventet feil: {exc}") from exc
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
